@@ -15,7 +15,11 @@ session: aiohttp.ClientSession | None = None
 @app.on_event("startup")
 async def _startup():
     global session
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+    connector = aiohttp.TCPConnector(limit=64, keepalive_timeout=30)
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=20),
+        connector=connector
+    )
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -27,8 +31,16 @@ async def _shutdown():
 def _authed(req: Request) -> bool:
     return (not TTS_SHARED_TOKEN) or (req.headers.get("X-TTS-Token") == TTS_SHARED_TOKEN)
 
+def _accept_for(fmt: str) -> str:
+    """Map format string to appropriate Accept header for ElevenLabs"""
+    fmt = (fmt or "").lower()
+    if "ogg" in fmt or "opus" in fmt:
+        return "audio/ogg"
+    return "audio/mpeg"
+
 async def eleven_stream(text: str, voice_id: str = None, model_id: str = None, 
-                        voice_settings: dict = None, optimize_latency: int = 4):
+                        voice_settings: dict = None, optimize_latency: int = 4,
+                        accept: str = "audio/mpeg"):
     """Stream audio from ElevenLabs with configurable parameters"""
     assert session is not None, "Session not initialized"
     
@@ -39,7 +51,7 @@ async def eleven_stream(text: str, voice_id: str = None, model_id: str = None,
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
     headers = {
         "xi-api-key": ELEVEN_API_KEY,
-        "Accept": "audio/mpeg",  # MP3 for better compatibility
+        "Accept": accept,  # Dynamic based on requested format
         "Content-Type": "application/json",
     }
     payload = {
@@ -88,26 +100,31 @@ async def owui_backend_compat(request: Request):
     # Voice ID (optional, use default if not provided)
     voice = payload.get("voice") or payload.get("voice_id") or ELEVEN_VOICE_ID
     
+    # Handle "Default" voice name by falling back to env voice
+    if voice and voice.lower() == "default":
+        voice = ELEVEN_VOICE_ID
+    
     # Format (optional, we default to MP3)
     fmt = payload.get("format") or "audio/mpeg"
     
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' or 'input' field")
     
-    # Map format string to proper MIME type
-    if "ogg" in fmt.lower() or "opus" in fmt.lower():
-        media_type = "audio/ogg"
-    elif "mpeg" in fmt.lower() or "mp3" in fmt.lower():
-        media_type = "audio/mpeg"
-    else:
-        media_type = "audio/mpeg"  # default to MP3
+    # Get proper Accept header and media type for requested format
+    accept = _accept_for(fmt)
     
     # Use our optimized Flash 2.5 pipeline
     return StreamingResponse(
-        eleven_stream(text=text, voice_id=voice, model_id="eleven_flash_v2_5", optimize_latency=4),
-        media_type=media_type,
+        eleven_stream(text=text, voice_id=voice, model_id="eleven_flash_v2_5", 
+                     optimize_latency=4, accept=accept),
+        media_type=accept,
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"}
     )
+
+@app.post("/tts//speech")
+async def owui_backend_compat_slashslash(request: Request):
+    """Alias for double-slash (handles trailing slash in TTS_API_BASE_URL)"""
+    return await owui_backend_compat(request)
 
 @app.post("/v1/text-to-speech/{voice_id}")
 async def eleven_compatible(voice_id: str, request: Request):
@@ -163,6 +180,11 @@ async def openai_audio_speech(req: OpenAITTSRequest, request: Request):
     
     text = req.input.strip()
     voice = req.voice or ELEVEN_VOICE_ID
+    
+    # Handle "Default" voice name by falling back to env voice
+    if voice and voice.lower() == "default":
+        voice = ELEVEN_VOICE_ID
+    
     fmt = (req.response_format or "mp3").lower()
     speed = req.speed or 1.0
     
@@ -172,14 +194,18 @@ async def openai_audio_speech(req: OpenAITTSRequest, request: Request):
     if not voice:
         raise HTTPException(status_code=400, detail="Missing voice ID")
     
+    # Get proper Accept header and media type for requested format
+    accept = _mime_type(fmt)
+    
     # Use our optimized Flash 2.5 pipeline
     return StreamingResponse(
         eleven_stream(
             text=text,
             voice_id=voice,
             model_id="eleven_flash_v2_5",
-            optimize_latency=4
+            optimize_latency=4,
+            accept=accept
         ),
-        media_type=_mime_type(fmt),
+        media_type=accept,
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"}
     )
