@@ -73,6 +73,42 @@ async def speak(req: Request):
     if not text: raise HTTPException(status_code=400, detail="Empty text")
     return StreamingResponse(eleven_stream(text), media_type="audio/mpeg")
 
+@app.post("/tts/speech")
+async def owui_backend_compat(request: Request):
+    """Open Web UI backend-compatible endpoint (server-to-server)"""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    
+    # Open WebUI can send: {"text": "..."} or {"input": "..."}
+    text = payload.get("text") or payload.get("input") or ""
+    text = text.strip()
+    
+    # Voice ID (optional, use default if not provided)
+    voice = payload.get("voice") or payload.get("voice_id") or ELEVEN_VOICE_ID
+    
+    # Format (optional, we default to MP3)
+    fmt = payload.get("format") or "audio/mpeg"
+    
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text' or 'input' field")
+    
+    # Map format string to proper MIME type
+    if "ogg" in fmt.lower() or "opus" in fmt.lower():
+        media_type = "audio/ogg"
+    elif "mpeg" in fmt.lower() or "mp3" in fmt.lower():
+        media_type = "audio/mpeg"
+    else:
+        media_type = "audio/mpeg"  # default to MP3
+    
+    # Use our optimized Flash 2.5 pipeline
+    return StreamingResponse(
+        eleven_stream(text=text, voice_id=voice, model_id="eleven_flash_v2_5", optimize_latency=4),
+        media_type=media_type,
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"}
+    )
+
 @app.post("/v1/text-to-speech/{voice_id}")
 async def eleven_compatible(voice_id: str, request: Request):
     """ElevenLabs-compatible endpoint for Open Web UI (versioned)"""
