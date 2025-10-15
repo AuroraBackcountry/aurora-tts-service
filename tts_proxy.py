@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import aiohttp, os, json
 
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY", "")
@@ -74,7 +75,7 @@ async def speak(req: Request):
 
 @app.post("/v1/text-to-speech/{voice_id}")
 async def eleven_compatible(voice_id: str, request: Request):
-    """ElevenLabs-compatible endpoint for Open Web UI"""
+    """ElevenLabs-compatible endpoint for Open Web UI (versioned)"""
     body = await request.json()
     text = body.get("text", "").strip()
     
@@ -88,5 +89,61 @@ async def eleven_compatible(voice_id: str, request: Request):
     
     return StreamingResponse(
         eleven_stream(text, voice_id, model_id, voice_settings, optimize_latency),
-        media_type="audio/mpeg"
+        media_type="audio/mpeg",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"}
+    )
+
+@app.post("/text-to-speech/{voice_id}")
+async def eleven_compatible_alias(voice_id: str, request: Request):
+    """ElevenLabs-compatible endpoint alias (non-versioned path)"""
+    return await eleven_compatible(voice_id, request)
+
+# OpenAI-compatible TTS endpoint
+class OpenAITTSRequest(BaseModel):
+    model: str = "tts-1"
+    voice: str | None = None
+    input: str
+    response_format: str | None = "mp3"
+    speed: float | None = 1.0
+
+def _mime_type(fmt: str) -> str:
+    """Map response format to MIME type"""
+    return {
+        "mp3": "audio/mpeg",
+        "opus": "audio/ogg",
+        "wav": "audio/wav",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+    }.get((fmt or "mp3").lower(), "audio/mpeg")
+
+@app.post("/v1/audio/speech")
+async def openai_audio_speech(req: OpenAITTSRequest, request: Request):
+    """OpenAI-compatible TTS endpoint for Open Web UI"""
+    # Optional shared token check for server-to-server calls
+    if TTS_SHARED_TOKEN:
+        given = request.headers.get("X-TTS-Token", "")
+        if given != TTS_SHARED_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid TTS token")
+    
+    text = req.input.strip()
+    voice = req.voice or ELEVEN_VOICE_ID
+    fmt = (req.response_format or "mp3").lower()
+    speed = req.speed or 1.0
+    
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'input' text")
+    
+    if not voice:
+        raise HTTPException(status_code=400, detail="Missing voice ID")
+    
+    # Use our optimized Flash 2.5 pipeline
+    return StreamingResponse(
+        eleven_stream(
+            text=text,
+            voice_id=voice,
+            model_id="eleven_flash_v2_5",
+            optimize_latency=4
+        ),
+        media_type=_mime_type(fmt),
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"}
     )
